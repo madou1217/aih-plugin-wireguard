@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "protocolVersion": 1,
   "pluginId": "network.wireguard",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "engines": {
     "aih": ">=0.0.0"
   },

@@ -8,22 +8,71 @@ the local tooling, and a peer endpoint may itself be a relay.
 Version is reported, never enforced. State lives under
 $HOME/.ai_home/plugin-state/network.wireguard/ with 0600 config files.
 """
+import atexit
+import base64
 import json
 import os
 import platform
 import shutil
+import socket
+import struct
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 PLUGIN_ID = "network.wireguard"
-PLUGIN_VERSION = "0.1.1"
+PLUGIN_VERSION = "0.1.2"
 STATE_DIR = Path(os.environ.get("AIH_PLUGIN_STATE_DIR", Path.home() / ".ai_home" / "plugin-state" / PLUGIN_ID))
 STATE_FILE = STATE_DIR / "state.json"
 DEFAULT_STATE = {"enabled": False, "config": {}, "updatedAt": 0}
 DEFAULT_INTERFACE = "wg0"
-REQUIRED_FIELDS = ("privateKey", "address", "peerPublicKey", "endpoint", "allowedIPs")
+BASE_REQUIRED_FIELDS = ("privateKey", "address", "peerPublicKey", "allowedIPs")
+DEFAULT_LOCAL_UDP_PORT = 51822
+DEFAULT_REMOTE_UDP_PORT = 51821
+SSH_PROBE_TIMEOUT = 20
+
+# 远端中继脚本：stdin/stdout 走 SSH 通道，按 2 字节长度分帧；本地/远端都是环回 UDP，
+# 不监听任何公网端口。
+SSH_RELAY_SCRIPT = r"""
+import os, select, socket, struct, sys
+target = ("{target_host}", {target_port})
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("127.0.0.1", {bind_port}))
+sock.setblocking(False)
+out = sys.stdout.buffer
+
+def write(data):
+    out.write(struct.pack(">H", len(data)) + data)
+    out.flush()
+
+def read_exact(n):
+    data = b""
+    while len(data) < n:
+        chunk = os.read(0, n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+while True:
+    r, _, _ = select.select([sock, 0], [], [])
+    if sock in r:
+        data, _ = sock.recvfrom(65535)
+        write(data)
+    if 0 in r:
+        head = read_exact(2)
+        if head is None:
+            break
+        size = struct.unpack(">H", head)[0]
+        body = read_exact(size)
+        if body is None:
+            break
+        sock.sendto(body, target)
+"""
+
+_TRANSPORTS = {}
 
 
 def log(message):
@@ -77,6 +126,156 @@ def proxy_env(state):
     }
 
 
+def transport_mode(config):
+    mode = str(config.get("transport") or "udp").strip().lower()
+    return mode if mode in ("udp", "ssh") else "udp"
+
+
+def port_value(config, key, default):
+    raw = str(config.get(key) or "").strip()
+    if raw.isdigit() and 0 < int(raw) <= 65535:
+        return int(raw)
+    return default
+
+
+class SSHTransport:
+    """把 WireGuard 的 UDP 报文经 SSH 通道转发，避免要求对端开放任何 UDP 端口。"""
+
+    def __init__(self, command, local_port):
+        self.alive = True
+        self.last = None
+        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp.bind(("127.0.0.1", local_port))
+        self.proc = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, bufsize=0,
+        )
+        threading.Thread(target=self._udp_to_ssh, daemon=True).start()
+        threading.Thread(target=self._ssh_to_udp, daemon=True).start()
+
+    def _udp_to_ssh(self):
+        while self.alive:
+            try:
+                data, addr = self.udp.recvfrom(65535)
+            except OSError:
+                return
+            self.last = addr
+            try:
+                self.proc.stdin.write(struct.pack(">H", len(data)) + data)
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                return
+
+    @staticmethod
+    def _read_exact(stream, size):
+        data = b""
+        while len(data) < size:
+            chunk = stream.read(size - len(data))
+            if not chunk:
+                return None
+            data += chunk
+        return data
+
+    def _ssh_to_udp(self):
+        stream = self.proc.stdout
+        while self.alive:
+            head = self._read_exact(stream, 2)
+            if head is None:
+                return
+            size = struct.unpack(">H", head)[0]
+            body = self._read_exact(stream, size)
+            if body is None:
+                return
+            if self.last is not None:
+                try:
+                    self.udp.sendto(body, self.last)
+                except OSError:
+                    return
+
+    def running(self):
+        return self.alive and self.proc.poll() is None
+
+    def stop(self):
+        self.alive = False
+        try:
+            self.udp.close()
+        except OSError:
+            pass
+        try:
+            self.proc.terminate()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=3)
+        except (subprocess.TimeoutExpired, OSError):
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+
+
+def ssh_transport_command(config):
+    host = str(config.get("sshHost") or "").strip()
+    user = str(config.get("sshUser") or "").strip()
+    peer = str(config.get("sshPeerUdp") or "").strip()
+    if not host or not user or ":" not in peer:
+        return None, "SSH 传输需要 sshHost、sshUser 与 sshPeerUdp（例如 127.0.0.1:51820）"
+    target_host, target_port = peer.rsplit(":", 1)
+    if not target_port.isdigit():
+        return None, "sshPeerUdp 端口无效"
+    bind_port = port_value(config, "remoteUdpPort", DEFAULT_REMOTE_UDP_PORT)
+    script = SSH_RELAY_SCRIPT.format(
+        target_host=target_host, target_port=int(target_port), bind_port=bind_port)
+    encoded = base64.b64encode(script.encode()).decode()
+    prefix = str(config.get("sshRemoteCommand") or "").strip() or "python3"
+    remote_command = prefix + " -c \"import base64;exec(base64.b64decode('%s'))\"" % encoded
+    args = [
+        "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+        "-o", "ConnectTimeout=10",
+        "-p", str(port_value(config, "sshPort", 22)),
+    ]
+    identity = str(config.get("sshIdentityFile") or "").strip()
+    if identity:
+        args += ["-i", str(Path(identity).expanduser())]
+    args += [user + "@" + host, remote_command]
+    return args, ""
+
+
+def start_ssh_transport(state):
+    interface = interface_name(state)
+    stop_ssh_transport(interface)
+    config = state.get("config") or {}
+    command, error = ssh_transport_command(config)
+    if command is None:
+        return None, error
+    local_port = port_value(config, "localUdpPort", DEFAULT_LOCAL_UDP_PORT)
+    try:
+        transport = SSHTransport(command, local_port)
+    except OSError as exc:
+        return None, f"SSH 传输启动失败：{exc}"
+    time.sleep(2.0)
+    if not transport.running():
+        transport.stop()
+        return None, "SSH 传输启动后立即退出，请检查 sshHost、sshUser 与身份文件"
+    _TRANSPORTS[interface] = transport
+    return transport, ""
+
+
+def stop_ssh_transport(interface):
+    transport = _TRANSPORTS.pop(interface, None)
+    if transport is not None:
+        transport.stop()
+
+
+def stop_all_transports():
+    for interface in list(_TRANSPORTS):
+        stop_ssh_transport(interface)
+
+
+atexit.register(stop_all_transports)
+
+
 def command_output(out, err, limit=20):
     text = (err or out or "").strip()
     if not text:
@@ -128,10 +327,15 @@ def interface_up(name):
 
 
 def config_complete(config):
-    for key in REQUIRED_FIELDS:
+    for key in BASE_REQUIRED_FIELDS:
         if not str(config.get(key) or "").strip():
             return False
-    return True
+    if transport_mode(config) == "ssh":
+        for key in ("sshHost", "sshUser", "sshPeerUdp"):
+            if not str(config.get(key) or "").strip():
+                return False
+        return True
+    return bool(str(config.get("endpoint") or "").strip())
 
 
 def config_file(state):
@@ -160,6 +364,9 @@ def write_config(state):
     address = str(config.get("address") or "").strip()
     if address:
         lines.append(f"Address = {address}")
+    listen_port = str(config.get("listenPort") or "").strip()
+    if listen_port.isdigit() and 0 < int(listen_port) <= 65535:
+        lines.append(f"ListenPort = {int(listen_port)}")
     dns = str(config.get("dns") or "").strip()
     if dns:
         lines.append(f"DNS = {dns}")
@@ -167,7 +374,10 @@ def write_config(state):
     preshared = str(config.get("presharedKey") or "").strip()
     if preshared:
         lines.append(f"PresharedKey = {preshared}")
-    lines.append(f"Endpoint = {str(config.get('endpoint') or '').strip()}")
+    endpoint = str(config.get("endpoint") or "").strip()
+    if transport_mode(config) == "ssh":
+        endpoint = "127.0.0.1:%d" % port_value(config, "localUdpPort", DEFAULT_LOCAL_UDP_PORT)
+    lines.append(f"Endpoint = {endpoint}")
     lines.append(f"AllowedIPs = {str(config.get('allowedIPs') or '').strip()}")
     keepalive = str(config.get("persistentKeepalive") or "").strip()
     if keepalive:
@@ -203,6 +413,8 @@ def status_view(state=None):
         message = "请先配置接口、私钥、对端公钥、Endpoint 与 AllowedIPs"
     elif not running:
         message = "配置已保存；执行 enable 需要管理员权限"
+    if running and transport_mode(config) == "ssh" and name not in _TRANSPORTS:
+        message = "SSH 传输中继未运行；请重新执行 enable"
 
     if running:
         connectivity = {
@@ -247,6 +459,15 @@ def describe():
                     "type": "object",
                     "properties": {
                         "interfaceName": {"type": "string", "description": "接口名，默认 wg0"},
+                        "transport": {"type": "string", "description": "udp（默认，直连对端）或 ssh（复用现有 SSH 通道，无需对端开放端口）"},
+                        "sshHost": {"type": "string", "description": "SSH 传输：对端主机名或 IP"},
+                        "sshPort": {"type": "string", "description": "SSH 传输：SSH 端口，默认 22"},
+                        "sshUser": {"type": "string", "description": "SSH 传输：SSH 用户名"},
+                        "sshIdentityFile": {"type": "string", "description": "SSH 传输：可选的私钥路径（缺省用 ssh-agent）"},
+                        "sshPeerUdp": {"type": "string", "description": "SSH 传输：对端 WireGuard 的 UDP 地址，例如 127.0.0.1:51820"},
+                        "sshRemoteCommand": {"type": "string", "description": "SSH 传输：远端执行前缀，默认 python3（可指定命名空间包装等）"},
+                        "localUdpPort": {"type": "string", "description": "SSH 传输：本机中继 UDP 端口，默认 51822"},
+                        "remoteUdpPort": {"type": "string", "description": "SSH 传输：对端中继 UDP 端口，默认 51821"},
                         "privateKey": {"type": "string", "description": "本机 WireGuard 私钥（base64）"},
                         "address": {"type": "string", "description": "接口地址，例如 10.0.0.2/32"},
                         "dns": {"type": "string", "description": "可选 DNS，例如 1.1.1.1"},
@@ -254,6 +475,7 @@ def describe():
                         "presharedKey": {"type": "string", "description": "可选预共享密钥"},
                         "endpoint": {"type": "string", "description": "对端 endpoint，例如 vpn.example.com:51820"},
                         "allowedIPs": {"type": "string", "description": "路由网段，例如 0.0.0.0/0, ::/0"},
+                        "listenPort": {"type": "string", "description": "可选监听端口；需要被对端主动连接或在端口映射后使用，例如 51820"},
                         "persistentKeepalive": {"type": "string", "description": "可选保活秒数，例如 25"},
                         "proxyUrl": {"type": "string", "description": "安装使用的 HTTP(S) 或 SOCKS 代理"},
                     },
@@ -271,7 +493,9 @@ def configure(state, value):
         if isinstance(value.get("value"), str):
             config["privateKey"] = value["value"].strip()
         for key in ("interfaceName", "privateKey", "address", "dns", "peerPublicKey",
-                    "presharedKey", "endpoint", "allowedIPs", "persistentKeepalive", "proxyUrl"):
+                    "presharedKey", "endpoint", "allowedIPs", "listenPort", "persistentKeepalive", "proxyUrl",
+                    "transport", "sshHost", "sshPort", "sshUser", "sshIdentityFile", "sshPeerUdp",
+                    "sshRemoteCommand", "localUdpPort", "remoteUdpPort"):
             if isinstance(value.get(key), str):
                 config[key] = value[key].strip()
     elif isinstance(value, str):
@@ -329,6 +553,11 @@ def enable(state):
     if not config_complete(config):
         return {"ok": False, "changed": False, "message": "配置不完整：需要私钥、地址、对端公钥、Endpoint 与 AllowedIPs", "status": status_view(state)}
     path = write_config(state)
+    if transport_mode(config) == "ssh":
+        _, transport_error = start_ssh_transport(state)
+        if transport_error:
+            return {"ok": False, "changed": False, "message": transport_error,
+                    "status": status_view(state)}
     if on_linux():
         code, out, err = install_system_config(path, state)
         if code == 0:
@@ -341,6 +570,7 @@ def enable(state):
     output = command_output(out, err)
     if code != 0:
         log(err or out)
+        stop_ssh_transport(interface_name(state))
         return {"ok": False, "changed": False, "message": sudo_message(output, "up", target), "output": output, "status": status_view(state)}
     state["enabled"] = True
     save_state(state)
@@ -353,6 +583,7 @@ def disable(state):
     path = config_file(state)
     before = status_view(state).get("running")
     if not before:
+        stop_ssh_transport(interface_name(state))
         state["enabled"] = False
         save_state(state)
         return {"ok": True, "changed": False, "message": "WireGuard 未在运行", "status": status_view(state)}
@@ -369,6 +600,7 @@ def disable(state):
     if code != 0:
         log(err or out)
         return {"ok": False, "changed": False, "message": sudo_message(output, "down", display), "output": output, "status": status_view(state)}
+    stop_ssh_transport(interface_name(state))
     state["enabled"] = False
     save_state(state)
     return {"ok": True, "changed": True, "message": "WireGuard 已停用", "output": output, "status": status_view(state)}
