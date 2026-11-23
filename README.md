@@ -68,6 +68,9 @@ never echo them.
 
 - Enabling/disabling requires `sudo -n`; interactive password prompts are not
   supported from the plugin process.
+- On Linux the generated config is installed to `/etc/wireguard/<iface>.conf`
+  before `wg-quick up <iface>`, because the shipped AppArmor profile only
+  allows `wg-quick` to read that directory; the copy is removed on disable.
 - macOS may additionally require the WireGuard userspace implementation or the
   WireGuard app; failures are returned verbatim.
 - No Electron, WebView, CDP, or traffic interception.

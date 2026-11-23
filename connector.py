@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 PLUGIN_ID = "network.wireguard"
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.1.1"
 STATE_DIR = Path(os.environ.get("AIH_PLUGIN_STATE_DIR", Path.home() / ".ai_home" / "plugin-state" / PLUGIN_ID))
 STATE_FILE = STATE_DIR / "state.json"
 DEFAULT_STATE = {"enabled": False, "config": {}, "updatedAt": 0}
@@ -136,6 +136,22 @@ def config_complete(config):
 
 def config_file(state):
     return STATE_DIR / (interface_name(state) + ".conf")
+
+
+def on_linux():
+    return platform.system() == "Linux"
+
+
+def system_config_path(state):
+    return "/etc/wireguard/" + interface_name(state) + ".conf"
+
+
+def install_system_config(path, state):
+    """Linux: wg-quick 的 AppArmor 配置只放行 /etc/wireguard，把生成配置安装过去。"""
+    code, out, err = run(["sudo", "-n", "install", "-d", "-m", "700", "/etc/wireguard"], timeout=30)
+    if code == 0:
+        code, out, err = run(["sudo", "-n", "install", "-m", "600", str(path), system_config_path(state)], timeout=30)
+    return code, out, err
 
 
 def write_config(state):
@@ -271,6 +287,8 @@ def install(state):
         return {"ok": True, "changed": False, "message": "wireguard-tools 已安装", "status": status_view(state)}
     brew = shutil.which("brew")
     if not brew:
+        if on_linux():
+            return {"ok": False, "changed": False, "message": "Linux 请用发行版包管理器安装 wireguard-tools 后重试"}
         return {"ok": False, "changed": False, "message": "未找到 Homebrew；请手动安装 wireguard-tools 后重试"}
     code, out, err = run([brew, "install", "wireguard-tools"], timeout=600, env=proxy_env(state))
     output = command_output(out, err)
@@ -311,11 +329,19 @@ def enable(state):
     if not config_complete(config):
         return {"ok": False, "changed": False, "message": "配置不完整：需要私钥、地址、对端公钥、Endpoint 与 AllowedIPs", "status": status_view(state)}
     path = write_config(state)
-    code, out, err = run(["sudo", "-n", wg_quick_path(), "up", str(path)], timeout=90)
+    if on_linux():
+        code, out, err = install_system_config(path, state)
+        if code == 0:
+            # 按接口名启动，wg-quick 会读取 /etc/wireguard/<iface>.conf。
+            code, out, err = run(["sudo", "-n", wg_quick_path(), "up", interface_name(state)], timeout=90)
+        target = system_config_path(state)
+    else:
+        code, out, err = run(["sudo", "-n", wg_quick_path(), "up", str(path)], timeout=90)
+        target = str(path)
     output = command_output(out, err)
     if code != 0:
         log(err or out)
-        return {"ok": False, "changed": False, "message": sudo_message(output, "up", path), "output": output, "status": status_view(state)}
+        return {"ok": False, "changed": False, "message": sudo_message(output, "up", target), "output": output, "status": status_view(state)}
     state["enabled"] = True
     save_state(state)
     return {"ok": True, "changed": True, "message": "WireGuard 已启用", "output": output, "status": status_view(state)}
@@ -330,11 +356,19 @@ def disable(state):
         state["enabled"] = False
         save_state(state)
         return {"ok": True, "changed": False, "message": "WireGuard 未在运行", "status": status_view(state)}
-    code, out, err = run(["sudo", "-n", wg_quick_path(), "down", str(path)], timeout=60)
+    if on_linux():
+        target = interface_name(state)
+        code, out, err = run(["sudo", "-n", wg_quick_path(), "down", target], timeout=60)
+        if code == 0:
+            run(["sudo", "-n", "rm", "-f", system_config_path(state)], timeout=30)
+        display = system_config_path(state)
+    else:
+        code, out, err = run(["sudo", "-n", wg_quick_path(), "down", str(path)], timeout=60)
+        display = str(path)
     output = command_output(out, err)
     if code != 0:
         log(err or out)
-        return {"ok": False, "changed": False, "message": sudo_message(output, "down", path), "output": output, "status": status_view(state)}
+        return {"ok": False, "changed": False, "message": sudo_message(output, "down", display), "output": output, "status": status_view(state)}
     state["enabled"] = False
     save_state(state)
     return {"ok": True, "changed": True, "message": "WireGuard 已停用", "output": output, "status": status_view(state)}
