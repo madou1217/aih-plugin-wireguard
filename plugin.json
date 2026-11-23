@@ -1,0 +1,38 @@
+{
+  "manifestVersion": 1,
+  "protocolVersion": 1,
+  "pluginId": "network.wireguard",
+  "version": "0.1.0",
+  "engines": {
+    "aih": ">=0.0.0"
+  },
+  "runtime": "process",
+  "entry": "connector.py",
+  "exec": {
+    "argv": [
+      "python3",
+      "connector.py"
+    ]
+  },
+  "permissions": {
+    "network": [],
+    "filesystem": {
+      "read": [
+        "state"
+      ],
+      "write": [
+        "state"
+      ]
+    },
+    "secrets": [],
+    "environment": []
+  },
+  "contributes": [
+    {
+      "id": "network.wireguard.connector",
+      "capability": "network.connector",
+      "version": 1,
+      "failurePolicy": "delegate"
+    }
+  ]
+}
